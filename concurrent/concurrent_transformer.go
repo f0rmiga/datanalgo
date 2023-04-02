@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package concurrent provides functionality to concurrently apply a series of transformations
+// on a list of input items while preserving the order of input items in the output. It supports
+// transformations with and without error handling and can be used with any input and output types.
 package concurrent
 
 import "sync"
@@ -32,6 +35,19 @@ type Transformer[Input any, Output any] interface {
 	// that transforms an input item into an output item and may return an error.
 	// If an action returns an error, the processing is halted, and the error is returned.
 	TransformWithError(items []Input, actions ...TransformActionWithError[Input, Output]) ([]Output, error)
+
+	// TransformChannels takes a channel of input items and applies the provided actions
+	// concurrently, not guaranteeing the order of input items in the output channel. Each action
+	// is a function that transforms an input item into an output item. This method doesn't
+	// handle errors and assumes that the actions will not return an error.
+	TransformChannels(items <-chan Input, actions ...TransformAction[Input, Output]) <-chan Output
+
+	// TransformChannelsWithError takes a channel of input items and applies the provided
+	// actions concurrently, not guaranteeing the order of input items in the output channel. Each
+	// action is a function that transforms an input item into an output item and may return
+	// an error. If an action returns an error, the processing is halted, and the error is
+	// sent to the error channel.
+	TransformChannelsWithError(items <-chan Input, actions ...TransformActionWithError[Input, Output]) (<-chan Output, <-chan error)
 }
 
 type transformer[Input any, Output any] struct {
@@ -47,78 +63,180 @@ func NewTransformer[Input any, Output any](workers int) Transformer[Input, Outpu
 }
 
 func (t *transformer[Input, Output]) Transform(items []Input, actions ...TransformAction[Input, Output]) []Output {
-	channels := make([]chan indexedItem[any], len(actions)+1)
-	channels[0] = make(chan indexedItem[any], len(items))
-
 	// Send the items to the first channel along with their indices.
+	itemsCh := make(chan IndexedItem[any], len(items))
 	go func() {
-		defer close(channels[0])
+		defer close(itemsCh)
 		for i, item := range items {
-			channels[0] <- indexedItem[any]{Index: i, Item: item}
+			itemsCh <- IndexedItem[any]{Index: i, Item: item}
 		}
 	}()
 
-	// Create a pipeline of worker functions connected by channels.
-	for i, action := range actions {
-		outputCh := make(chan indexedItem[any], len(items))
-		channels[i+1] = outputCh
-		var wg sync.WaitGroup
-		for j := 0; j < t.workers; j++ {
-			wg.Add(1)
-			go worker(channels[i], outputCh, action, &wg)
+	transformedItemsCh := process[Input, Output](itemsCh, actions, t.workers, func(
+		inputChan <-chan IndexedItem[any],
+		outputChan chan<- IndexedItem[any],
+		action TransformAction[Input, Output],
+		wg *sync.WaitGroup,
+	) {
+		defer wg.Done()
+		for indexedInput := range inputChan {
+			output := action(indexedInput.Item.(Input))
+			outputChan <- IndexedItem[any]{Index: indexedInput.Index, Item: output}
 		}
-		go func() {
-			wg.Wait()
-			close(outputCh)
-		}()
-	}
+	})
 
 	// Collect the results and maintain the input order.
-	results := make([]Output, len(items))
-	for indexedItem := range channels[len(channels)-1] {
-		results[indexedItem.Index] = indexedItem.Item.(Output)
+	transformedItems := make([]Output, len(items))
+	for indexedItem := range transformedItemsCh {
+		transformedItems[indexedItem.Index] = indexedItem.Item.(Output)
 	}
 
-	return results
+	return transformedItems
 }
 
 func (t *transformer[Input, Output]) TransformWithError(items []Input, actions ...TransformActionWithError[Input, Output]) ([]Output, error) {
-	channels := make([]chan indexedItem[any], len(actions)+1)
-	channels[0] = make(chan indexedItem[any], len(items))
-
 	// Send the items to the first channel along with their indices.
+	itemsCh := make(chan IndexedItemWithError[any], len(items))
 	go func() {
-		defer close(channels[0])
+		defer close(itemsCh)
 		for i, item := range items {
-			channels[0] <- indexedItem[any]{Index: i, Item: item}
+			itemsCh <- IndexedItemWithError[any]{Index: i, Item: item}
 		}
 	}()
 
-	// Create a pipeline of worker functions connected by channels.
-	for i, action := range actions {
-		outputCh := make(chan indexedItem[any], len(items))
-		channels[i+1] = outputCh
-		var wg sync.WaitGroup
-		for j := 0; j < t.workers; j++ {
-			wg.Add(1)
-			go workerWithError(channels[i], outputCh, action, &wg)
+	transformedItemsCh := process[Input, Output](itemsCh, actions, t.workers, func(
+		inputChan <-chan IndexedItemWithError[any],
+		outputChan chan<- IndexedItemWithError[any],
+		action TransformActionWithError[Input, Output],
+		wg *sync.WaitGroup,
+	) {
+		defer wg.Done()
+		for indexedInput := range inputChan {
+			output, err := action(indexedInput.Item.(Input))
+			outputChan <- IndexedItemWithError[any]{Index: indexedInput.Index, Item: output, Err: err}
 		}
-		go func() {
-			wg.Wait()
-			close(outputCh)
-		}()
-	}
+	})
 
 	// Collect the results and maintain the input order.
-	results := make([]Output, len(items))
-	for indexedItem := range channels[len(channels)-1] {
+	transformedItems := make([]Output, len(items))
+	for indexedItem := range transformedItemsCh {
 		if indexedItem.Err != nil {
 			return nil, indexedItem.Err
 		}
-		results[indexedItem.Index] = indexedItem.Item.(Output)
+		transformedItems[indexedItem.Index] = indexedItem.Item.(Output)
 	}
 
-	return results, nil
+	return transformedItems, nil
+}
+
+func (t *transformer[Input, Output]) TransformChannels(items <-chan Input, actions ...TransformAction[Input, Output]) <-chan Output {
+	itemsCh := make(chan any, len(items))
+	go func() {
+		defer close(itemsCh)
+		for item := range items {
+			itemsCh <- item
+		}
+	}()
+
+	transformedItemsCh := process[Input, Output](itemsCh, actions, t.workers, func(
+		inputChan <-chan any,
+		outputChan chan<- any,
+		action TransformAction[Input, Output],
+		wg *sync.WaitGroup,
+	) {
+		defer wg.Done()
+		for indexedInput := range inputChan {
+			output := action(indexedInput.(Input))
+			outputChan <- output
+		}
+	})
+
+	transformedItems := make(chan Output, len(items))
+	go func() {
+		defer close(transformedItems)
+		for item := range transformedItemsCh {
+			transformedItems <- item.(Output)
+		}
+	}()
+
+	return transformedItems
+}
+
+func (t *transformer[Input, Output]) TransformChannelsWithError(items <-chan Input, actions ...TransformActionWithError[Input, Output]) (<-chan Output, <-chan error) {
+	itemsCh := make(chan ItemWithError[any], len(items))
+	go func() {
+		defer close(itemsCh)
+		for item := range items {
+			itemsCh <- ItemWithError[any]{Item: item}
+		}
+	}()
+
+	transformedItemsCh := process[Input, Output](itemsCh, actions, t.workers, func(
+		inputChan <-chan ItemWithError[any],
+		outputChan chan<- ItemWithError[any],
+		action TransformActionWithError[Input, Output],
+		wg *sync.WaitGroup,
+	) {
+		defer wg.Done()
+		for indexedInput := range inputChan {
+			output, err := action(indexedInput.Item.(Input))
+			outputChan <- ItemWithError[any]{Item: output, Err: err}
+		}
+	})
+
+	transformedItems := make(chan Output, len(items))
+	errors := make(chan error, 1)
+	go func() {
+		defer close(transformedItems)
+		defer close(errors)
+		for item := range transformedItemsCh {
+			if item.Err != nil {
+				errors <- item.Err
+				return
+			}
+			transformedItems <- item.Item.(Output)
+		}
+	}()
+
+	return transformedItems, errors
+}
+
+func process[
+	Input any,
+	Output any,
+	Item itemType,
+	Action actionType[Input, Output],
+	Worker func(inputChan <-chan Item, outputChan chan<- Item, action Action, wg *sync.WaitGroup),
+](
+	items <-chan Item,
+	actions []Action,
+	workers int,
+	worker Worker,
+) <-chan Item {
+	channels := make([]chan Item, len(actions))
+
+	// Create a pipeline of worker functions connected by channels.
+	for i, action := range actions {
+		var inputChan <-chan Item
+		if i == 0 {
+			inputChan = items
+		} else {
+			inputChan = channels[i-1]
+		}
+		outputChan := make(chan Item, len(items))
+		channels[i] = outputChan
+		var wg sync.WaitGroup
+		for j := 0; j < workers; j++ {
+			wg.Add(1)
+			go worker(inputChan, outputChan, action, &wg)
+		}
+		go func() {
+			wg.Wait()
+			close(outputChan)
+		}()
+	}
+
+	return channels[len(channels)-1]
 }
 
 // TransformAction is a function that takes an input item and transforms it into an output item.
@@ -131,26 +249,33 @@ type TransformAction[Input any, Output any] func(Input) Output
 // TransformWithError method to handle errors during the transformation process.
 type TransformActionWithError[Input any, Output any] func(Input) (Output, error)
 
-type indexedItem[Item any] struct {
+// ItemWithError is a struct that holds an item and an associated error. It is used to
+// represent the result of a transformation that may return an error.
+type ItemWithError[Item any] struct {
+	Item Item
+	Err  error
+}
+
+// IndexedItem is a struct that holds an item and its index. It is used to
+// maintain the order of input items during concurrent transformations.
+type IndexedItem[Item any] struct {
+	Index int
+	Item  Item
+}
+
+// IndexedItemWithError is a struct that holds an item, its index, and an associated error.
+// It is used to maintain the order of input items during concurrent transformations that
+// may return errors.
+type IndexedItemWithError[Item any] struct {
 	Index int
 	Item  Item
 	Err   error
 }
 
-func worker[Input any, Output any](inputCh <-chan indexedItem[any], outputCh chan<- indexedItem[any], action TransformAction[Input, Output], wg *sync.WaitGroup) {
-	defer wg.Done()
-	for indexedInput := range inputCh {
-		output := action(indexedInput.Item.(Input))
-		indexedItem := indexedItem[any]{Index: indexedInput.Index, Item: output}
-		outputCh <- indexedItem
-	}
+type itemType interface {
+	ItemWithError[any] | IndexedItem[any] | IndexedItemWithError[any] | any
 }
 
-func workerWithError[Input any, Output any](inputCh <-chan indexedItem[any], outputCh chan<- indexedItem[any], action TransformActionWithError[Input, Output], wg *sync.WaitGroup) {
-	defer wg.Done()
-	for indexedInput := range inputCh {
-		output, err := action(indexedInput.Item.(Input))
-		indexedItem := indexedItem[any]{Index: indexedInput.Index, Item: output, Err: err}
-		outputCh <- indexedItem
-	}
+type actionType[Input any, Output any] interface {
+	TransformAction[Input, Output] | TransformActionWithError[Input, Output]
 }

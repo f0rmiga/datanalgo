@@ -16,6 +16,7 @@ package concurrent_test
 
 import (
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 
@@ -155,6 +156,102 @@ func TestTransformWithError(t *testing.T) {
 
 	for _, tc := range testCasesMultipleTransformers {
 		t.Run(tc.name, runTestWithError(tc))
+	}
+}
+
+func TestTransformChannels(t *testing.T) {
+	workers := 4
+	transformer := concurrent.NewTransformer[int, int](workers)
+
+	inputItems := []int{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	inputChan := make(chan int, len(inputItems))
+	for _, item := range inputItems {
+		inputChan <- item
+	}
+	close(inputChan)
+
+	outputChan := transformer.TransformChannels(inputChan, func(item int) int {
+		return item * 2
+	})
+
+	expectedOutput := make(map[int]bool)
+	for _, item := range inputItems {
+		expectedOutput[item*2] = false
+	}
+
+	for output := range outputChan {
+		if _, ok := expectedOutput[output]; !ok {
+			t.Errorf("Unexpected output: %d", output)
+		} else {
+			expectedOutput[output] = true
+		}
+	}
+
+	for item, seen := range expectedOutput {
+		if !seen {
+			t.Errorf("Expected output not seen: %d", item)
+		}
+	}
+}
+
+func TestTransformChannelsWithError(t *testing.T) {
+	workers := 4
+	transformer := concurrent.NewTransformer[int, int](workers)
+
+	inputItems := []int{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	inputChan := make(chan int, len(inputItems))
+	for _, item := range inputItems {
+		inputChan <- item
+	}
+	close(inputChan)
+
+	outputChan, errChan := transformer.TransformChannelsWithError(inputChan, func(item int) (int, error) {
+		if item%5 == 0 {
+			return 0, errors.New("item is divisible by 5")
+		}
+		return item * 2, nil
+	})
+
+	expectedOutput := make(map[int]bool)
+	for _, item := range inputItems {
+		if item%5 != 0 {
+			expectedOutput[item*2] = false
+		}
+	}
+
+	var outputError error
+	var outputs []int
+	for {
+		select {
+		case output, ok := <-outputChan:
+			if !ok {
+				outputChan = nil
+			} else {
+				outputs = append(outputs, output)
+			}
+		case err, ok := <-errChan:
+			if !ok {
+				errChan = nil
+			} else {
+				outputError = err
+			}
+		}
+
+		if outputChan == nil && errChan == nil {
+			break
+		}
+	}
+
+	if outputError == nil {
+		t.Errorf("Expected an error but did not receive one")
+	}
+
+	sort.Ints(outputs)
+
+	for i, output := range outputs {
+		if output != inputItems[i]*2 && inputItems[i]%5 != 0 {
+			t.Errorf("Expected output %d, but got %d", inputItems[i]*2, output)
+		}
 	}
 }
 
